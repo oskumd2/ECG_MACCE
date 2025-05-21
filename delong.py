@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import scipy.stats
 from scipy import stats
+from sklearn.metrics import average_precision_score
 
 
 # AUC comparison adapted from
@@ -407,46 +408,38 @@ def get_metric(y_true, y_prob,threshold,verbose = True):
     scores['AUC95%CI'],  scores['AUC'] = get_95CI(y_true,y_pred)
     return scores
 
-if __name__ == '__main__':
-    # example
-    import sklearn.datasets
-    import sklearn.model_selection
-    import sklearn.linear_model    
-    import numpy
-    import scipy.stats
 
-    x_distr = scipy.stats.norm(0.5, 1)
-    y_distr = scipy.stats.norm(-0.5, 1)
-    sample_size_x = 7
-    sample_size_y = 14
-    n_trials = 1000
-    aucs = numpy.empty(n_trials)
-    variances = numpy.empty(n_trials)
-    numpy.random.seed(1234235)
-    labels = numpy.concatenate([numpy.ones(sample_size_x), numpy.zeros(sample_size_y)])
 
-    scores1 = numpy.concatenate([
-            x_distr.rvs(sample_size_x),
-            y_distr.rvs(sample_size_y)])
-    scores2 = numpy.concatenate([
-            x_distr.rvs(sample_size_x),
-            y_distr.rvs(sample_size_y)])
+def auprc_test(y_test, y_test_proba_1, y_test_proba_2, n_bootstrap=1000, random_state=42):
+    """
+    Returns paired t-test p-value of AUPRCs between models 1 and 2 by bootstrapping.
 
-    #examples
-    y_true= labels
-    y_pred_1 = scores1
-    y_pred_2 = scores2
+    Args:
+        y_test: array-like, true binary labels
+        y_test_proba_1: array-like, predicted probabilities from model 1
+        y_test_proba_2: array-like, predicted probabilities from model 2
+        n_bootstrap: int, number of bootstrap samples
+        random_state: int, random seed
 
-    #Delong test p-value
-    pvalue = delong_roc_test(y_true,y_pred_1,y_pred_2)
-    print('p_value:', pvalue)
-    
-    # 95CI, AUC
-    ci,auc = get_95CI(labels,scores1)
-    print('The AUC of score1:',auc,'\tThe 95CI of score1:',ci)
-    
-    # find threshold with youden index
-    thres = get_optimal_threshold(labels,scores1)
-    score = get_metric(labels, scores1,thres,verbose = True)
-    print('Threshold is:',thres)
-    print('The metrics on this threshold are:\n',score)
+    Returns:
+        p-value from paired t-test of bootstrapped AUPRCs
+    """
+    rng = np.random.RandomState(random_state)
+    n = len(y_test)
+    auprc_1 = []
+    auprc_2 = []
+    for _ in range(n_bootstrap):
+        idx = rng.choice(n, n, replace=True)
+        y_true_bs = np.array(y_test)[idx]
+        y_pred1_bs = np.array(y_test_proba_1)[idx]
+        y_pred2_bs = np.array(y_test_proba_2)[idx]
+        # If only one class present in y_true_bs, average_precision_score returns a warning and a degenerate value
+        # We'll skip such bootstrap samples
+        if len(np.unique(y_true_bs)) < 2:
+            continue
+        auprc_1.append(average_precision_score(y_true_bs, y_pred1_bs))
+        auprc_2.append(average_precision_score(y_true_bs, y_pred2_bs))
+    auprc_1 = np.array(auprc_1)
+    auprc_2 = np.array(auprc_2)
+    t_stat, p_value = scipy.stats.ttest_rel(auprc_1, auprc_2)
+    return p_value

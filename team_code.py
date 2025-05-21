@@ -31,6 +31,7 @@ from datetime import datetime
 import copy
 from pathlib import Path
 from evaluate_model import load_weights #, compute_challenge_metric
+import threading
 
 from lxml import etree as ET
 import base64
@@ -41,7 +42,7 @@ DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 bsize = 16
 model_path = None
 
-TRAIN_DATA_CSV = 'C:/rsrch/240923_ecg_ich/data_labels_M_N.csv'
+TRAIN_DATA_CSV = 'data_labels_M_N.csv'
 TRAIN_DATA_FOLDER = 'C:/rsrch/240801_ecg_mace/data/'
 ################################################################################
 #
@@ -102,65 +103,104 @@ class mytqdm(tqdm):
         else:
             self._val = self.alpha*self._val + (1-self.alpha)*loss
         super(mytqdm, self).set_postfix({'loss': self._val})
-    
+
+
 class dataset:
     classes = [0,1]
     normal_class = 0
 
     def __init__(self, header_files):
-        df = pd.read_csv(TRAIN_DATA_CSV)
+        # Speedup 1: Read CSV only once, outside the loop
+        df = pd.read_csv(TRAIN_DATA_CSV, engine='python', encoding='utf-8')
+        df.set_index('filename', inplace=True)  # Faster lookup
 
-        self.files =[]
-        self.gender=[]
-        self.age=[]
+        # Speedup 2: Pre-allocate and use list comprehensions where possible
+        expected_leads = ['I', 'II', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6','III', 'aVR', 'aVL', 'aVF']
+        expected_leads_set = set(expected_leads)
 
-    
-        for h in tqdm(header_files):
+        # Speedup 3: Use threading to parallelize file parsing
+        def process_header(h):
             tmp = dict()
             tmp['header'] = h
+            try:
+                x = ET.parse(TRAIN_DATA_FOLDER + h).iter('LeadData')
+            except Exception:
+                return None  # skip if file can't be parsed
 
-            expected_leads = ['I', 'II', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6','III', 'aVR', 'aVL', 'aVF']
-            x = ET.parse(TRAIN_DATA_FOLDER+h).iter('LeadData')
-            ilead = 0
-            ecg_waveforms = [""] * 8
+            ecg_waveforms = [None] * 8
             for c in x:
-                # 500 hz * 10초 * 8 채널
-                nsamp = int(c.find('LeadSampleCountTotal').text)
-                if nsamp != 5000:
+                try:
+                    nsamp = int(c.find('LeadSampleCountTotal').text)
+                    if nsamp != 5000:
+                        continue
+                    lead = c.find('LeadID').text
+                    if lead not in expected_leads_set:
+                        break
+                    buf = base64.b64decode(c.find('WaveFormData').text)
+                    data = np.frombuffer(buf, '<i2', nsamp)
+                    ecg_waveforms[expected_leads.index(lead)] = data
+                    del buf, data  # Remove as soon as used
+                except Exception:
                     continue
-                lead = c.find('LeadID').text
-                if lead not in expected_leads:
-                    break
-                buf = base64.b64decode(c.find('WaveFormData').text)
-                data = np.frombuffer(buf, '<i2', nsamp) # nsamp
-                ecg_waveforms[expected_leads.index(lead)]=data
-                ilead += 1
             try:
                 vals = np.array(ecg_waveforms, dtype=np.float32)
-            except:
-                continue
-            tmp['fs']=500
-            tmp['record'] = np.append(vals, [vals[1]-vals[0], -(vals[1]+vals[0])*0.5, vals[0]-vals[1]*0.5, vals[1]-vals[0]*0.5], axis=0)   
+                if np.any([v is None for v in ecg_waveforms]):
+                    return None
+            except Exception:
+                return None
+            tmp['fs'] = 500
+            tmp['record'] = np.append(
+                vals,
+                [vals[1] - vals[0], -(vals[1] + vals[0]) * 0.5, vals[0] - vals[1] * 0.5, vals[1] - vals[0] * 0.5],
+                axis=0
+            )
+            del vals  # Remove as soon as used
             tmp['leads'] = expected_leads
-            tmp['dx'] = df.loc[df['filename'] == h,'label'].values[0]
+            try:
+                row = df.loc[h]
+            except KeyError:
+                return None
+            tmp['dx'] = row['label']
             tmp['target'] = np.zeros((2,))
             if tmp['dx'] in dataset.classes:
                 idx = dataset.classes.index(tmp['dx'])
                 tmp['target'][idx] = 1
-            tmp['age'] = df.loc[df['filename'] == h,'age'].values[0] # !CONCAT!
-            tmp['gender'] = df.loc[df['filename'] == h,'gender'].values[0] # !CONCAT!
-            self.files.append(tmp)
-        self.files = pd.DataFrame(self.files)        
+                del idx  # Remove as soon as used
+            tmp['age'] = row['age'] # !CONCAT!
+            tmp['gender'] = row['gender'] # !CONCAT!
+            del row  # Remove as soon as used
+            return tmp
+
+        # Use ThreadPool for parallel file parsing
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_h = {executor.submit(process_header, h): h for h in header_files}
+            for future in tqdm(as_completed(future_to_h), total=len(header_files), desc="Loading dataset"):
+                res = future.result()
+                if res is not None:
+                    results.append(res)
+        del future_to_h  # Remove as soon as used
+
+        self.files = pd.DataFrame(results)
+        del results  # Remove as soon as used
         self.sample = True
-        self.num_leads = 12 #None
+        self.num_leads = 12
         # set filter parameters
         self.b, self.a = signal.butter(3, [1 / 250, 47 / 250], 'bandpass')
 
     def summary(self, output):
         if output == 'pandas':
-            return pd.Series(np.stack(self.files['target'].to_list(), axis=0).sum(axis=0), index=dataset.classes)
+            arr = np.stack(self.files['target'].to_list(), axis=0)
+            result = pd.Series(arr.sum(axis=0), index=dataset.classes)
+            del arr
+            return result
         if output == 'numpy':
-            return np.stack(self.files['target'].to_list(), axis=0).sum(axis=0)
+            arr = np.stack(self.files['target'].to_list(), axis=0)
+            result = arr.sum(axis=0)
+            del arr
+            return result
 
     def __len__(self):
         return len(self.files)
@@ -171,10 +211,11 @@ class dataset:
         leads = self.files.iloc[item]['leads']
         data = self.files.iloc[item]['record']
         age = self.files.iloc[item]['age'] # !CONCAT!
-        gender= self.files.iloc[item]['gender'] # !CONCAT!
+        gender = self.files.iloc[item]['gender'] # !CONCAT!
 
         # expand to 12 lead setup if original signal has less channels
         data, lead_indicator = expand_leads(data, input_leads=leads)
+        del leads  # Remove as soon as used
         data = np.nan_to_num(data)
 
         # resample to 500hz
@@ -194,114 +235,17 @@ class dataset:
             fs = int(fs)
             # random sample signal if len > 8192 samples
             if data.shape[-1] >= 8192:
-                idx = data.shape[-1] - 8192-1
+                idx = data.shape[-1] - 8192 - 1
                 idx = np.random.randint(idx)
                 data = data[:, idx:idx + 8192]
+                del idx  # Remove as soon as used
 
         mu = np.nanmean(data, axis=-1, keepdims=True)
         std = np.nanstd(data, axis=-1, keepdims=True)
-        # std = np.nanstd(data.flatten())
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             data = (data - mu) / std
-        data = np.nan_to_num(data)
-
-        # random choose number of leads to keep
-        data, lead_indicator = lead_exctractor.get(
-            data, self.num_leads, lead_indicator)
-
-        return data, target, lead_indicator, age, gender # !CONCAT!
-
-
-class dataset_mimic:
-    classes = [0,1]
-    normal_class = 0
-
-    def __init__(self, header_files):
-        df = pd.read_csv('mimic_data_labels_2.csv')
-
-        self.files =[]
-        self.gender=[]
-        self.age=[]
-
-    
-        for h in tqdm(header_files):
-            tmp = dict()
-            tmp['header'] = h
-
-            expected_leads = ['I', 'II', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6','III', 'aVR', 'aVL', 'aVF']
-            record = wfdb.rdrecord('C:/rsrch/240801_ecg_mace/mimic_ecg_data/' + str(h)).p_signal
-            record = np.transpose(record)
-            ecg_waveforms = [""] * 12
-            for id in range(len(expected_leads)):
-                lead = wfdb.rdrecord('C:/rsrch/240801_ecg_mace/mimic_ecg_data/'+h).sig_name[id]
-                ecg_waveforms[expected_leads.index(lead)]=record[id]            
-
-            tmp['fs']=500
-            tmp['record'] = np.array(ecg_waveforms)    
-            tmp['leads'] = expected_leads
-            tmp['dx'] = df.loc[df['path'] == h,'label'].values[0]
-            tmp['target'] = np.zeros((2,))
-            if tmp['dx'] in dataset.classes:
-                idx = dataset.classes.index(tmp['dx'])
-                tmp['target'][idx] = 1
-            tmp['age'] = df.loc[df['path'] == h,'age'].values[0] # !CONCAT!
-            tmp['gender'] = df.loc[df['path'] == h,'gender'].values[0] # !CONCAT!
-            self.files.append(tmp)
-        self.files = pd.DataFrame(self.files)        
-        self.sample = True
-        self.num_leads = 12 #None
-        # set filter parameters
-        self.b, self.a = signal.butter(3, [1 / 250, 47 / 250], 'bandpass')
-
-    def summary(self, output):
-        if output == 'pandas':
-            return pd.Series(np.stack(self.files['target'].to_list(), axis=0).sum(axis=0), index=dataset.classes)
-        if output == 'numpy':
-            return np.stack(self.files['target'].to_list(), axis=0).sum(axis=0)
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, item):
-        fs = self.files.iloc[item]['fs']
-        target = self.files.iloc[item]['target']
-        leads = self.files.iloc[item]['leads']
-        data = self.files.iloc[item]['record']
-        age = self.files.iloc[item]['age'] # !CONCAT!
-        gender= self.files.iloc[item]['gender'] # !CONCAT!
-
-        # expand to 12 lead setup if original signal has less channels
-        data, lead_indicator = expand_leads(data, input_leads=leads)
-        data = np.nan_to_num(data)
-
-        # resample to 500hz
-        if fs == float(1000):
-            data = signal.resample_poly(
-                data, up=1, down=2, axis=-1)  # to 500Hz
-            fs = 500
-        elif fs == float(500):
-            pass
-        else:
-            data = signal.resample(data, int(data.shape[1] * 500 / fs), axis=1)
-            fs = 500
-
-        data = signal.filtfilt(self.b, self.a, data)
-
-        if self.sample:
-            fs = int(fs)
-            # random sample signal if len > 8192 samples
-            if data.shape[-1] >= 8192:
-                idx = data.shape[-1] - 8192-1
-                idx = np.random.randint(idx)
-                data = data[:, idx:idx + 8192]
-
-        mu = np.nanmean(data, axis=-1, keepdims=True)
-        std = np.nanstd(data, axis=-1, keepdims=True)
-        # std = np.nanstd(data.flatten())
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            data = (data - mu) / std
+        del mu, std  # Remove as soon as used
         data = np.nan_to_num(data)
 
         # random choose number of leads to keep
@@ -452,109 +396,6 @@ def train_part(model, dataset, loss, opt):
 
     return auroc
 
-def training_code(data_directory, model_directory):
-    select4deployment.calls = 0
-    _training_code(data_directory, model_directory, str(0))
-    #_training_code(data_directory, model_directory, str(1))
-    #_training_code(data_directory, model_directory, str(2))
-
-def _training_code(data_directory, model_directory, ensamble_ID):
-    # Find header and recording files.
-    print('Finding header and recording files...')
-
-    df = pd.read_csv(TRAIN_DATA_CSV)
-    unique_patient_ids = df['hid'].unique()
-    random.shuffle(unique_patient_ids)
-    num_train_patients = int(len(unique_patient_ids) * (1-0.2))
-    # Split the unique 'PatientID's into train and test sets
-    train_patients = unique_patient_ids[:num_train_patients]
-    test_patients = unique_patient_ids[num_train_patients:]
-
-    train = dataset(header_files=df.loc[df['hid'].isin(train_patients),'filename'].to_list())
-    train.num_leads = 12
-    train.sample = True
-    valid = dataset(header_files=df.loc[df['hid'].isin(test_patients),'filename'].to_list())
-    valid.num_leads = 12
-    valid.sample = False
-
-    valid.files.reset_index(drop=True, inplace=True)
-    # negative to positive ratio
-    loss_weight = (len(train) - train.summary(output='numpy')) / \
-        train.summary(output='numpy')
-
-    # to be saved in resulting model pickle
-    train_files = train.files['header'].to_list()
-    train_files = [k.split('/')[-1] for k in train_files]
-    valid_files = valid.files['header'].to_list()
-    valid_files = [k.split('/')[-1] for k in valid_files]
-
-    # Create a folder for the model if it does not already exist.
-    if not os.path.isdir(model_directory):
-        os.mkdir(model_directory)
-
-    train = DataLoader(dataset=train,
-                       batch_size=bsize,
-                       shuffle=True,
-                       num_workers=8,
-                       collate_fn=collate,
-                       pin_memory=True,
-                       drop_last=False)
-
-    valid = DataLoader(dataset=valid,
-                       batch_size=bsize,
-                       shuffle=False,
-                       num_workers=8,
-                       collate_fn=collate,
-                       pin_memory=True,
-                       drop_last=False)
-
-    model = FinalModel(num_classes=2).to(DEVICE) #26
-    if model_path is not None:
-        model.load_state_dict(torch.load(model_path))
-        print('Model Loaded!')
-
-    lossBCE = nn.BCEWithLogitsLoss(
-        pos_weight=torch.tensor(loss_weight).to(DEVICE))
-    opt = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.StepLR(opt, step_size=20, gamma=0.1)
-    OUTPUT = []
-    EPOCHS = 5 # orig: 100
-    for epoch in range(EPOCHS):
-        print(
-            f"============================[{epoch}]============================")
-        train_auprc = train_part(model, train, lossBCE, opt)
-        print(train_auprc)
-
-        valid_auprc, valid_targets, valid_outputs = valid_part(model, valid) #challenge_metric
-        print(valid_auprc)
-
-        OUTPUT.append({'epoch': epoch,
-                       'model': copy.deepcopy(model).cpu().state_dict(),
-                       'train_auprc': train_auprc,
-                       'valid_auprc': valid_auprc,
-                       'valid_targets': valid_targets,
-                       'valid_outputs': valid_outputs, #'val_challenge_metric': challenge_metric
-                       }) 
-        scheduler.step()
-        name = Path(model_directory, f'PROGRESS_{ensamble_ID}.pickle')
-        with open(name, 'wb') as handle:
-            pickle.dump(OUTPUT, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            pickle.dump(train_files, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            pickle.dump(valid_files, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            pickle.dump(dataset.classes, handle,
-                        protocol=pickle.HIGHEST_PROTOCOL)
-            pickle.dump(loss_weight, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-    name = Path(model_directory, f'PROGRESS_{ensamble_ID}.pickle')
-    with open(name, 'wb') as handle:
-        pickle.dump(OUTPUT, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        pickle.dump(train_files, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        pickle.dump(valid_files, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        pickle.dump(dataset.classes, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        pickle.dump(loss_weight, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-    find_thresholds(name, model_directory)
-
 
 # Generic function for loading a model.
 def _load_model(model_directory, id):
@@ -585,8 +426,6 @@ def load_model(model_directory, leads):
 # Running trained model functions
 #
 ################################################################################
-
-
 def expand_leads(recording, input_leads):
     output = np.zeros((12, recording.shape[1]))
     twelve_leads = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF',
@@ -664,9 +503,3 @@ def run_model(model, header, recording,age,gender):
     labels = np.sum(out_labels, axis=0)
     labels = np.array(labels, dtype=int)
     return classes, labels, q, features
-
-################################################################################
-#
-# Other functions
-#
-################################################################################
