@@ -8,9 +8,6 @@ import numpy as np
 from glob import glob
 import pandas as pd
 
-# Check if a variable is a number or represents a number.
-
-
 def is_number(x):
     try:
         float(x)
@@ -18,26 +15,17 @@ def is_number(x):
     except (ValueError, TypeError):
         return False
 
-# Check if a variable is an integer or represents an integer.
-
-
 def is_integer(x):
     if is_number(x):
         return float(x).is_integer()
     else:
         return False
 
-# Check if a variable is a a finite number or represents a finite number.
-
-
 def is_finite_number(x):
     if is_number(x):
         return np.isfinite(float(x))
     else:
         return False
-
-# (Re)sort leads using the standard order of leads for the standard twelve-lead ECG.
-
 
 def sort_leads(leads):
     x = ('I', 'II', 'III', 'aVR', 'aVL', 'aVF',
@@ -46,24 +34,15 @@ def sort_leads(leads):
         x.index(lead) if lead in x else len(x) + leads.index(lead)))
     return tuple(leads)
 
-# Find header and recording files.
-
-
 def find_challenge_files(data_directory):
     all_files = glob(os.path.join(data_directory, '*'))
 
     return [x for x in all_files if x.endswith('.xml')]
 
-# Load header file as a string.
-
-
 def load_header(header_file):
     with open(header_file, 'r') as f:
         header = f.read()
     return header
-
-# Load recording file as an array.
-
 
 def choose_leads(recording, header, leads):
     num_leads = len(leads)
@@ -75,9 +54,6 @@ def choose_leads(recording, header, leads):
             j = available_leads.index(lead)
             chosen_recording[i, :] = recording[j, :]
     return chosen_recording
-
-# Get recording ID.
-
 
 def get_recording_id(header):
     recording_id = None
@@ -91,9 +67,6 @@ def get_recording_id(header):
             break
     return recording_id
 
-# Get leads from header.
-
-
 def get_leads(header):
     leads = list()
     for i, l in enumerate(header.split('\n')):
@@ -106,9 +79,6 @@ def get_leads(header):
             break
     return tuple(leads)
 
-# Get age from header.
-
-
 def get_age(header):
     age = None
     for l in header.split('\n'):
@@ -119,9 +89,6 @@ def get_age(header):
                 age = float('nan')
     return age
 
-# Get sex from header.
-
-
 def get_sex(header):
     sex = None
     for l in header.split('\n'):
@@ -131,9 +98,6 @@ def get_sex(header):
             except:
                 pass
     return sex
-
-# Get frequency from header.
-
 
 def get_num_leads(header):
     num_leads = None
@@ -147,9 +111,6 @@ def get_num_leads(header):
             break
     return num_leads
 
-# Get frequency from header.
-
-
 def get_frequency(header):
     frequency = None
     for i, l in enumerate(header.split('\n')):
@@ -162,9 +123,6 @@ def get_frequency(header):
             break
     return frequency
 
-# Get number of samples from header.
-
-
 def get_num_samples(header):
     num_samples = None
     for i, l in enumerate(header.split('\n')):
@@ -176,9 +134,6 @@ def get_num_samples(header):
         else:
             break
     return num_samples
-
-# Get analog-to-digital converter (ADC) gains from header.
-
 
 def get_adc_gains(header, leads):
     adc_gains = np.zeros(len(leads))
@@ -198,9 +153,6 @@ def get_adc_gains(header, leads):
             break
     return adc_gains
 
-# Get baselines from header.
-
-
 def get_baselines(header, leads):
     baselines = np.zeros(len(leads))
     for i, l in enumerate(header.split('\n')):
@@ -219,9 +171,6 @@ def get_baselines(header, leads):
             break
     return baselines
 
-# Get labels from header.
-
-
 def get_labels(header):
     labels = list()
     for l in header.split('\n'):
@@ -233,25 +182,15 @@ def get_labels(header):
             except:
                 pass
     return labels
-
-# Save outputs from model.
-
-
 def save_outputs(output_file, recording_id, classes, labels, probabilities):
-    # Format the model outputs.
     recording_string = '#{}'.format(recording_id)
     class_string = ','.join(str(c) for c in classes)
     label_string = ','.join(str(l) for l in labels)
     probabilities_string = ','.join(str(p) for p in probabilities)
     output_string = recording_string + '\n' + class_string + \
         '\n' + label_string + '\n' + probabilities_string + '\n'
-
-    # Save the model outputs.
     with open(output_file, 'w') as f:
         f.write(output_string)
-
-# Load outputs from model.
-
 
 def load_outputs(output_file):
     with open(output_file, 'r') as f:

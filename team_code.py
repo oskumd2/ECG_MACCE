@@ -1,8 +1,4 @@
 #!/usr/bin/env python
-
-# Edit this script to add your team's training code.
-# Some functions are *required*, but you can edit most parts of required functions, remove non-required functions, and add your own function.
-
 from helper_code import *
 import numpy as np
 import os
@@ -41,15 +37,8 @@ np.random.seed(0)
 DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 bsize = 16
 model_path = None
-
 TRAIN_DATA_CSV = 'data_labels_M_N.csv'
 TRAIN_DATA_FOLDER = 'C:/rsrch/240801_ecg_mace/data/'
-################################################################################
-#
-# Training function
-#
-################################################################################
-
 
 def find_thresholds(filename, model_directory):
     with open(filename, 'rb') as handle:
@@ -114,11 +103,9 @@ class dataset:
         df = pd.read_csv(TRAIN_DATA_CSV, engine='python', encoding='utf-8')
         df.set_index('filename', inplace=True)  # Faster lookup
 
-        # Speedup 2: Pre-allocate and use list comprehensions where possible
         expected_leads = ['I', 'II', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6','III', 'aVR', 'aVL', 'aVF']
         expected_leads_set = set(expected_leads)
 
-        # Speedup 3: Use threading to parallelize file parsing
         def process_header(h):
             tmp = dict()
             tmp['header'] = h
@@ -171,20 +158,22 @@ class dataset:
             del row  # Remove as soon as used
             return tmp
 
-        # Use ThreadPool for parallel file parsing
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # Use ThreadPool for parallel file parsing, but keep order of header_files
+        from concurrent.futures import ThreadPoolExecutor
 
-        results = []
+        results = [None] * len(header_files)
         with ThreadPoolExecutor(max_workers=8) as executor:
-            future_to_h = {executor.submit(process_header, h): h for h in header_files}
-            for future in tqdm(as_completed(future_to_h), total=len(header_files), desc="Loading dataset"):
+            futures = [executor.submit(process_header, h) for h in header_files]
+            for i, future in enumerate(tqdm(futures, total=len(header_files), desc="Loading dataset")):
                 res = future.result()
-                if res is not None:
-                    results.append(res)
-        del future_to_h  # Remove as soon as used
+                results[i] = res
 
-        self.files = pd.DataFrame(results)
+        # Remove None results, but keep order of valid files
+        filtered_results = [r for r in results if r is not None]
         del results  # Remove as soon as used
+
+        self.files = pd.DataFrame(filtered_results)
+        del filtered_results  # Remove as soon as used
         self.sample = True
         self.num_leads = 12
         # set filter parameters

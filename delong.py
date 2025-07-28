@@ -55,21 +55,11 @@ def compute_midrank_weight(x, sample_weight):
     T2[J] = T
     return T2
 
-
-
 def fastDeLong(predictions_sorted_transposed, label_1_count, sample_weight=None):
-
     if sample_weight is None:
-
         return fastDeLong_no_weights(predictions_sorted_transposed, label_1_count)
-
     else:
-
         return fastDeLong_weights(predictions_sorted_transposed, label_1_count, sample_weight)
-
-
-
-
 
 def fastDeLong_weights(predictions_sorted_transposed, label_1_count, sample_weight):
 
@@ -412,7 +402,7 @@ def get_metric(y_true, y_prob,threshold,verbose = True):
 
 def auprc_test(y_test, y_test_proba_1, y_test_proba_2, n_bootstrap=1000, random_state=42):
     """
-    Returns paired t-test p-value of AUPRCs between models 1 and 2 by bootstrapping.
+    Returns the mean difference, 95% CI, and p-value for AUPRCs between models 1 and 2 using bootstrap.
 
     Args:
         y_test: array-like, true binary labels
@@ -422,24 +412,47 @@ def auprc_test(y_test, y_test_proba_1, y_test_proba_2, n_bootstrap=1000, random_
         random_state: int, random seed
 
     Returns:
-        p-value from paired t-test of bootstrapped AUPRCs
+        mean_diff: mean difference of AUPRCs (model 1 - model 2)
+        ci: tuple, (lower, upper) 95% confidence interval of the difference
+        p_value: proportion of bootstrap samples where difference <= 0
     """
-    rng = np.random.RandomState(random_state)
+    def metric_auprc(y, p):
+        from sklearn.metrics import precision_recall_curve, auc
+        prec, rec, _ = precision_recall_curve(y, p)
+        return auc(rec, prec)
+
+    y_test = np.array(y_test)
+    prob1 = np.array(y_test_proba_1)
+    prob2 = np.array(y_test_proba_2)
     n = len(y_test)
-    auprc_1 = []
-    auprc_2 = []
+    rng = np.random.default_rng(random_state)
+    differences = []
+
     for _ in range(n_bootstrap):
-        idx = rng.choice(n, n, replace=True)
-        y_true_bs = np.array(y_test)[idx]
-        y_pred1_bs = np.array(y_test_proba_1)[idx]
-        y_pred2_bs = np.array(y_test_proba_2)[idx]
-        # If only one class present in y_true_bs, average_precision_score returns a warning and a degenerate value
-        # We'll skip such bootstrap samples
-        if len(np.unique(y_true_bs)) < 2:
+        idx = rng.choice(n, size=n, replace=True)
+        y_sample = y_test[idx]
+        p1 = prob1[idx]
+        p2 = prob2[idx]
+
+        # Skip bootstrap samples with only one class present
+        if len(np.unique(y_sample)) < 2:
             continue
-        auprc_1.append(average_precision_score(y_true_bs, y_pred1_bs))
-        auprc_2.append(average_precision_score(y_true_bs, y_pred2_bs))
-    auprc_1 = np.array(auprc_1)
-    auprc_2 = np.array(auprc_2)
-    t_stat, p_value = scipy.stats.ttest_rel(auprc_1, auprc_2)
+
+        try:
+            score1 = metric_auprc(y_sample, p1)
+            score2 = metric_auprc(y_sample, p2)
+            differences.append(score1 - score2)
+        except Exception:
+            continue
+
+    diff_array = np.array(differences)
+    if len(diff_array) == 0:
+        # If all bootstrap samples failed, return NaNs
+        return np.nan, (np.nan, np.nan), np.nan
+
+    lower = np.percentile(diff_array, 2.5)
+    upper = np.percentile(diff_array, 97.5)
+    mean_diff = np.mean(diff_array)
+    p_value = np.mean(diff_array <= 0)
+
     return p_value
